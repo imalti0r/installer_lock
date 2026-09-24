@@ -1,12 +1,12 @@
 #!/system/bin/sh
 # service.sh - 开机后确保MIUI安装器为自定义版本
-# 策略: force-stop → bind mount MIUI路径 → pm install → force-stop
+# 策略: force-stop → bind mount APK + 隐藏oat → pm uninstall旧更新 → pm install → force-stop
 
 MODDIR=${0%/*}
 APK="$MODDIR/custom_installer.apk"
 PKG="com.miui.packageinstaller"
 LOGFILE="$MODDIR/module.log"
-VERSION="v2.0.0"
+VERSION="v2.1.0"
 
 # ====== 日志函数 ======
 log() {
@@ -60,10 +60,9 @@ SRC_SIZE=$(wc -c < "$APK" 2>/dev/null)
 log_step "force-stop安装器"
 am force-stop "$PKG" 2>/dev/null
 
-# ====== Step 2: bind mount MIUI路径 ======
-log_step "开机后bind mount MIUI路径"
+# ====== Step 2: bind mount APK + 隐藏oat（开机后重试）======
+log_step "开机后bind mount APK + 隐藏oat"
 
-# pm path获取（过滤出MIUI版）
 PM_PATHS=$(pm path "$PKG" 2>/dev/null | grep -v "/data/" | sed 's/^package://' | tr -d '\r\n ')
 
 MIUI_PATHS="$PM_PATHS
@@ -76,47 +75,99 @@ MIUI_PATHS="$PM_PATHS
 "
 
 MOUNT_SUCCESS=0
+MOUNTED_DIRS=""
+
 for p in $MIUI_PATHS; do
     if [ -z "$p" ] || [ ! -f "$p" ]; then continue; fi
 
-    # 只处理MIUI版路径
     case "$p" in
         *MIUI*|*Miui*|*miui*) ;;
         *) continue ;;
     esac
 
-    if mount 2>/dev/null | grep -q "$p"; then
-        log_info "已mount，跳过: $p"
-        continue
-    fi
-
-    CURRENT_SIZE=$(wc -c < "$p" 2>/dev/null)
-    if [ "$CURRENT_SIZE" = "$SRC_SIZE" ]; then
-        log_info "大小已一致，跳过: $p"
-        continue
-    fi
-
-    log_info "bind mount: $APK -> $p"
-    mount --bind "$APK" "$p" 2>/dev/null
-    rc=$?
-    if [ $rc -eq 0 ]; then
-        AFTER_SIZE=$(wc -c < "$p" 2>/dev/null)
-        if [ "$AFTER_SIZE" = "$SRC_SIZE" ]; then
-            log_info "成功: $p"
-            MOUNT_SUCCESS=$((MOUNT_SUCCESS + 1))
+    # APK bind mount
+    if ! mount 2>/dev/null | grep -q "$p"; then
+        CURRENT_SIZE=$(wc -c < "$p" 2>/dev/null)
+        if [ "$CURRENT_SIZE" != "$SRC_SIZE" ]; then
+            log_info "bind mount: $APK -> $p"
+            mount --bind "$APK" "$p" 2>/dev/null
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                AFTER_SIZE=$(wc -c < "$p" 2>/dev/null)
+                if [ "$AFTER_SIZE" = "$SRC_SIZE" ]; then
+                    log_info "APK mount成功: $p"
+                    MOUNT_SUCCESS=$((MOUNT_SUCCESS + 1))
+                    APK_DIR=$(dirname "$p")
+                    case "$MOUNTED_DIRS" in
+                        *"$APK_DIR"*) ;;
+                        *) MOUNTED_DIRS="$MOUNTED_DIRS $APK_DIR" ;;
+                    esac
+                else
+                    log_warn "mount成功但大小不一致: $p"
+                fi
+            else
+                log_warn "mount失败(rc=$rc): $p"
+            fi
         else
-            log_warn "mount成功但大小不一致: $p"
+            log_info "大小已一致，跳过: $p"
+            APK_DIR=$(dirname "$p")
+            case "$MOUNTED_DIRS" in
+                *"$APK_DIR"*) ;;
+                *) MOUNTED_DIRS="$MOUNTED_DIRS $APK_DIR" ;;
+            esac
         fi
     else
-        log_warn "mount失败(rc=$rc): $p"
+        log_info "已mount，跳过: $p"
+        APK_DIR=$(dirname "$p")
+        case "$MOUNTED_DIRS" in
+            *"$APK_DIR"*) ;;
+            *) MOUNTED_DIRS="$MOUNTED_DIRS $APK_DIR" ;;
+        esac
     fi
 done
 
-log_info "bind mount统计: 成功=$MOUNT_SUCCESS"
+log_info "APK bind mount统计: 成功=$MOUNT_SUCCESS"
 
-# ====== Step 3: pm install兜底 ======
+# 隐藏oat/vdex（开机后重试）
+log_step "开机后隐藏oat/vdex缓存"
+for d in $MOUNTED_DIRS; do
+    if [ -z "$d" ]; then continue; fi
+    OAT_DIR="$d/oat"
+    if [ -d "$OAT_DIR" ]; then
+        if ! mount 2>/dev/null | grep -q "$OAT_DIR"; then
+            mount -t tmpfs tmpfs "$OAT_DIR" 2>/dev/null
+            rc=$?
+            if [ $rc -eq 0 ]; then
+                log_info "tmpfs挂载成功: $OAT_DIR"
+            else
+                log_warn "tmpfs失败(rc=$rc): $OAT_DIR，尝试逐文件覆盖"
+                for f in "$OAT_DIR"/*/* "$OAT_DIR"/*; do
+                    if [ -f "$f" ]; then
+                        mount --bind /dev/null "$f" 2>/dev/null && log_info "已覆盖: $f"
+                    fi
+                done
+            fi
+        else
+            log_info "oat已挂载tmpfs: $OAT_DIR"
+        fi
+    fi
+done
+
+# ====== Step 3: 卸载旧的/data/app更新 + 重新安装 ======
 log_step "pm install兜底"
 
+# 先卸载/data层的旧安装（如果是更新安装的）
+DATA_APK=$(pm path "$PKG" 2>/dev/null | grep "/data/" | head -n1 | sed 's/^package://' | tr -d '\r\n ')
+if [ -n "$DATA_APK" ]; then
+    log_info "发现/data层安装: $DATA_APK"
+    log_info "先卸载旧更新..."
+    pm uninstall -k "$PKG" 2>/dev/null
+    rc=$?
+    log_info "pm uninstall rc=$rc"
+    sleep 1
+fi
+
+# 尝试安装
 log_info "尝试 pm install -r -d"
 INSTALL_OUTPUT=$(pm install -r -d "$APK" 2>&1)
 INSTALL_RC=$?
@@ -127,7 +178,13 @@ if [ $INSTALL_RC -ne 0 ]; then
     INSTALL_OUTPUT2=$(pm install -r "$APK" 2>&1)
     INSTALL_RC2=$?
     log_info "输出: $INSTALL_OUTPUT2 | rc=$INSTALL_RC2"
-    [ $INSTALL_RC2 -eq 0 ] && log_info "pm install -r成功" || log_error "pm install也失败"
+
+    if [ $INSTALL_RC2 -ne 0 ]; then
+        log_warn "pm install也失败(预期行为: 无核心破解时versionCode过低)"
+        log_info "bind mount + oat隐藏应已生效，pm install非必需"
+    else
+        log_info "pm install -r成功"
+    fi
 else
     log_info "pm install成功"
 fi
@@ -143,7 +200,7 @@ if [ -n "$CURRENT_APK" ]; then
     log_info "当前路径: $CURRENT_APK"
     case "$CURRENT_APK" in
         /data/*) log_info "位于/data层(pm install生效)" ;;
-        *) log_info "位于/system或/product层(bind mount生效)" ;;
+        *) log_info "位于/product层(bind mount生效)" ;;
     esac
 fi
 
