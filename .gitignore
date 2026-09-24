@@ -1,0 +1,10 @@
+# Binaries
+custom_installer.apk
+installer_lock_hyperos.zip
+
+# Magisk build artifacts
+system/
+
+# OS files
+Thumbs.db
+.DS_Store
