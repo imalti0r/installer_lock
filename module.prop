@@ -1,6 +1,6 @@
 id=installer_lock
 name=Installer Lock (HyperOS)
-version=v2.2.0
-versionCode=20200
+version=v3.0.0
+versionCode=30000
 author=Custom
-description=锁定MIUI安装器为自定义InstallerX。仅覆盖MIUI版路径，隐藏旧vdex/odex缓存防止白屏，含日志自动清理。
+description=开机后pm install覆盖安装自定义安装器(需核心破解支持)。仅pm install，无bind mount。
